@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: RDS PostgreSQL (single-AZ) database with environment-dependent credentials
+# Needed for Fn::ToJsonString and for !If inside DeletionPolicy
+Transform: AWS::LanguageExtensions
+
+Parameters:
+  Environment:
+    Type: String
+    Default: test
+    AllowedValues: ["test", "prod"]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DbEngineVersion:
+    Type: String
+    Default: ""
+    Description: Leave empty to use the current RDS default PostgreSQL version
+
+Conditions:
+  ProdEnv: !Equals [!Ref Environment, "prod"]
+  TestEnv: !Equals [!Ref Environment, "test"]
+  HasEngineVersion: !Not [!Equals [!Ref DbEngineVersion, ""]]
+
+Resources:
+  HardcodedDatabaseSecret:
+    Condition: TestEnv
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: "Database credentials"
+      SecretString:
+        Fn::ToJsonString:
+          username: "dbuser"
+          password: "dbpassword" # Do not do this in production!
+      Tags:
+        - Key: "Env"
+          Value: !Ref Environment
+        - Key: "Name"
+          Value: !Sub "${Environment}-${AWS::StackName}-secret"
+
+  GeneratedDatabaseSecret:
+    Condition: ProdEnv
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: "Database credentials"
+      GenerateSecretString:
+        SecretStringTemplate:
+          Fn::ToJsonString:
+            username: "dbuser"
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: "Env"
+          Value: !Ref Environment
+        - Key: "Name"
+          Value: !Sub "${Environment}-${AWS::StackName}-secret"
+
+  DatabaseSg:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Database security group
+      VpcId: !ImportValue VpcId
+      Tags:
+        - Key: "Env"
+          Value: !Ref Environment
+        - Key: "Name"
+          Value: !Sub "${Environment}-${AWS::StackName}-sg"
+
+  Database:
+    DeletionPolicy: !If [ProdEnv, "Retain", "Delete"]
+    UpdateReplacePolicy: !If [ProdEnv, "Retain", "Delete"]
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      Engine: postgres
+      EngineVersion: !If [HasEngineVersion, !Ref DbEngineVersion, !Ref "AWS::NoValue"]
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp2
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !If [ProdEnv, 7, 1]
+      DBSubnetGroupName: !ImportValue DbSubnetGroupId
+      MasterUsername:
+        Fn::If:
+          - ProdEnv
+          - !Sub "{{resolve:secretsmanager:${GeneratedDatabaseSecret}:SecretString:username}}"
+          - !Sub "{{resolve:secretsmanager:${HardcodedDatabaseSecret}:SecretString:username}}"
+      MasterUserPassword:
+        Fn::If:
+          - ProdEnv
+          - !Sub "{{resolve:secretsmanager:${GeneratedDatabaseSecret}:SecretString:password}}"
+          - !Sub "{{resolve:secretsmanager:${HardcodedDatabaseSecret}:SecretString:password}}"
+      VPCSecurityGroups:
+        - !Ref DatabaseSg
+      Tags:
+        - Key: "Env"
+          Value: !Ref Environment
+        - Key: "Name"
+          Value: !Sub "${Environment}-${AWS::StackName}-instance"
+
+  DatabaseSgIngressRule:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      IpProtocol: tcp
+      FromPort: !GetAtt Database.Endpoint.Port
+      ToPort: !GetAtt Database.Endpoint.Port
+      SourceSecurityGroupId: !ImportValue MiddlewareInstanceSg
+      GroupId: !Ref DatabaseSg
+
+Outputs:
+  DatabaseEndpointAddress:
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: DatabaseEndpointAddress
+
+  DatabaseEndpointPort:
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: DatabaseEndpointPort
+
+  DbCredentials:
+    Value: !If [ProdEnv, !Ref GeneratedDatabaseSecret, !Ref HardcodedDatabaseSecret]
+    Export:
+      Name: DbCredentials

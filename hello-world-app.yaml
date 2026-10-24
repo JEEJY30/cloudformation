@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Hello World application
+Parameters:
+
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: mykey
+
+  # The ONE place that decides which S3 bucket the instance reads from.
+  BucketName:
+    Type: String
+    Default: btu-cf-course-static-website-0001
+    Description: S3 bucket that holds hello-world-flask.py
+
+Resources:
+  # Launch template replaces the old launch configuration
+  Lt:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: t3.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        SecurityGroupIds:
+          - !Ref AppSg
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackName} \
+            --resource Lt --configsets InstallAndRun \
+            --region ${AWS::Region}
+    Metadata:
+      # Lets cfn-init sign its S3 download using the instance role
+      AWS::CloudFormation::Authentication:
+        S3Auth:
+          type: S3
+          buckets:
+            - !Ref BucketName
+          roleName: LabRole
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallAndRun:
+            - "Configure"
+        Configure:
+          packages:
+            yum:
+              python3: []
+              python3-pip: []
+          files:
+            /opt/helloworld.py:
+              owner: root
+              group: root
+              mode: "000755"
+              # Bucket + file name (object key) are set here
+              source: !Sub "https://${BucketName}.s3.${AWS::Region}.${AWS::URLSuffix}/hello-world-flask.py"
+            /etc/systemd/system/helloworld.service:
+              owner: root
+              group: root
+              mode: "000755"
+              content: |
+                [Unit]
+                Description=HelloWorld service
+                After=network.target
+                [Service]
+                Type=simple
+                User=root
+                ExecStart=usr/bin/python3 /opt/helloworld.py
+                Restart=on-abort
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            installflask:
+              command: "pip3 install flask"
+              test: "which pip3"
+            reloadsystemd:
+              command: "systemctl daemon-reload"
+          services:
+            sysvinit:
+              helloworld:
+                enabled: "true"
+                ensureRunning: "true"
+
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App Sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !Ref ElbSg
+          FromPort: 5000
+          ToPort: 5000
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !ImportValue VpcId
+
+  Elb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets:
+        - !ImportValue Subnet1Id
+        - !ImportValue Subnet2Id
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ElbSg
+
+  ElbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Elb Sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      VpcId: !ImportValue VpcId
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Elb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref Tg
+
+  Tg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !ImportValue VpcId
+
+  Asg:
+    DependsOn: Listener
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MaxSize: "1"
+      MinSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !ImportValue Subnet1Id
+        - !ImportValue Subnet2Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Lt
+        Version: !GetAtt Lt.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref Tg

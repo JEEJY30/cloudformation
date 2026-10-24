@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Prerequisites for db-template.yaml. Only deploy this if your account does not already
+  export VpcId, DbSubnetGroupId and MiddlewareInstanceSg.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: db-lab-vpc }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: db-lab-public }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: db-lab-private-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: db-lab-private-b }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  PublicRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRouteTable }
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  MiddlewareSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Middleware instance (no inbound, access via SSM Session Manager)
+      VpcId: !Ref Vpc
+
+  MiddlewareInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      InstanceType: t3.micro
+      IamInstanceProfile: LabInstanceProfile   # instance profile that wraps LabRole
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          GroupSet: [!Ref MiddlewareSg]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y mariadb105
+      Tags: [{ Key: Name, Value: middleware }]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: VpcId }
+  DbSubnetGroupId:
+    Value: !Ref DbSubnetGroup
+    Export: { Name: DbSubnetGroupId }
+  MiddlewareInstanceSg:
+    Value: !Ref MiddlewareSg
+    Export: { Name: MiddlewareInstanceSg }
+  MiddlewareInstanceId:
+    Value: !Ref MiddlewareInstance
